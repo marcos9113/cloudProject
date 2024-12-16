@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates an EC2 instance with Docker installed on it
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: project.key
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.small
+  AmiId:
+    Description: AMI Id of the EC2 instance OS
+    Type: AWS::EC2::Image::Id
+    Default: ami-03bb6d83c60fc5f7c
+
+Resources:
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          apt-get update -y
+          apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project-queue
+
+  HelloLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSQSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: "*"
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: my-lambda-function
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.client('dynamodb')
+              for record in event['Records']:
+                  message_body = json.loads(record['body'])
+
+                  # Extract necessary data from the SQS message
+                  product_id = message_body.get('product_id')
+                  product_name = message_body.get('product_name')
+                  quantity = message_body.get('quantity')
+                  price = message_body.get('price')
+                  discount = message_body.get('discount')
+                  category = message_body.get('category')
+                  retail_stock = message_body.get('retailStock')
+
+                  # Extract other relevant attributes
+                  if product_id:
+                      dynamodb.put_item(
+                          TableName='customer-records',
+                          Item={
+                              'Product_id': {'N': str(product_id)},
+                              'Product_name': {'S': product_name},
+                              'Quantity': {'N': str(quantity)},
+                              'Price': {'N': str(price)},
+                              'Discount': {'N': str(discount)},
+                              'Category': {'S': category},
+                              'RetailStock': {'S': retail_stock}
+                          }
+                      )
+                  else:
+                      print("Product ID not found in message.")
+      Handler: index.lambda_handler
+      Role: !GetAtt HelloLambdaRole.Arn
